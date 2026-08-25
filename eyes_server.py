@@ -7,6 +7,8 @@ monitor) and serves the live view to everyone at once:
     http://localhost:8990/frame.jpg     the latest frame Claude curls
     POST /observation  (plain text)     Claude narrates what it just saw
     http://localhost:8990/observations  the narration log as JSON
+    POST /activity     (plain text)     Claude reports what it's doing mid-look
+    http://localhost:8990/status        paused flag + Claude's current activity
 
 Run:  make run   (uv supplies Python; ffmpeg must be installed)
 Stop: Ctrl+C
@@ -93,9 +95,36 @@ class ObservationLog:
             return json.dumps({"observations": self.entries}).encode()
 
 
+class ClaudeActivity:
+    """What Claude is doing with the Eyes right now, shown live on the dash.
+    Set automatically when a non-browser client downloads a frame, refined by
+    POST /activity, cleared when the observation lands."""
+
+    def __init__(self) -> None:
+        self.text: str | None = None
+        self.at: float = 0.0
+        self.lock = threading.Lock()
+
+    def set(self, text: str) -> None:
+        with self.lock:
+            self.text = text
+            self.at = time.time()
+
+    def clear(self) -> None:
+        with self.lock:
+            self.text = None
+
+    def snapshot(self) -> dict | None:
+        with self.lock:
+            if self.text is None:
+                return None
+            return {"text": self.text, "at": self.at}
+
+
 class EyesRequestHandler(BaseHTTPRequestHandler):
     feed: CameraFeed
     observations: ObservationLog
+    activity: ClaudeActivity
 
     PAGE = """<!doctype html>
 <html><head><title>Claude's Eyes</title>
@@ -128,12 +157,19 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   #grow { background: none; color: #6cb2ff; border: none; font-size: 0.8em; cursor: pointer;
           padding: 4px 0; }
   #grow[hidden] { display: none; }
+  #activity { font-size: 0.9em; color: #6cb2ff; display: flex; align-items: center; gap: 8px; }
+  #activity[hidden] { display: none; }
+  #activity .dot { width: 8px; height: 8px; border-radius: 50%; background: #6cb2ff;
+                   animation: blink 1.2s infinite; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
+  @media (prefers-reduced-motion: reduce) { #activity .dot { animation: none; } }
 </style></head>
 <body>
 <h1>&#128065; Claude's Eyes</h1>
 <div id="loader">warming up the eyes&hellip;</div>
 <img id="view" alt="camera frame" hidden>
 <div id="status">connecting&hellip;</div>
+<div id="activity" hidden><span class="dot"></span><span id="activityText"></span></div>
 <button id="pause">Pause Eyes</button>
 <div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
 <ul id="log"></ul>
@@ -198,6 +234,21 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   let logLimit = 8;
   grow.addEventListener('click', () => { logLimit += 20; });
 
+  const activity = document.getElementById('activity');
+  const activityText = document.getElementById('activityText');
+  setInterval(async () => {
+    try {
+      const data = await (await fetch('/status', {cache: 'no-store'})).json();
+      const seconds = data.activity ? Date.now() / 1000 - data.activity.at : 999;
+      if (data.activity && seconds < 120) {
+        activity.hidden = false;
+        activityText.textContent = 'Claude: ' + data.activity.text + ' (' + agoText(seconds) + ')';
+      } else {
+        activity.hidden = true;
+      }
+    } catch (e) {}
+  }, 500);
+
   setInterval(async () => {
     try {
       const data = await (await fetch('/observations', {cache: 'no-store'})).json();
@@ -224,8 +275,16 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             self.send_frame()
         elif self.path.startswith("/observations"):
             self.send_json(self.observations.as_json())
+        elif self.path.startswith("/status"):
+            self.send_json(json.dumps({
+                "paused": self.feed.is_paused(),
+                "activity": self.activity.snapshot(),
+            }).encode())
         else:
             self.send_page()
+
+    def is_claude(self) -> bool:
+        return not self.headers.get("User-Agent", "").startswith("Mozilla")
 
     def do_POST(self) -> None:
         if self.path.startswith("/pause"):
@@ -241,6 +300,15 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
                 self.send_error(400, "empty observation")
                 return
             self.observations.add(text)
+            self.activity.clear()
+            self.send_json(b'{"ok": true}')
+        elif self.path.startswith("/activity"):
+            length = int(self.headers.get("Content-Length", 0))
+            text = self.rfile.read(length).decode("utf-8", errors="replace").strip()
+            if not text:
+                self.activity.clear()
+            else:
+                self.activity.set(text)
             self.send_json(b'{"ok": true}')
         else:
             self.send_error(404)
@@ -269,6 +337,8 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
         if age is None:
             self.send_error(503, "no frame captured yet")
             return
+        if self.is_claude():
+            self.activity.set("downloaded a frame, having a look…")
         body = self.feed.frame_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
@@ -290,11 +360,13 @@ class EyesServer:
         frame_path.parent.mkdir(exist_ok=True)
         self.feed = CameraFeed(frame_path)
         self.observations = ObservationLog()
+        self.activity = ClaudeActivity()
 
     def run(self) -> None:
         threading.Thread(target=self.feed.run_forever, daemon=True).start()
         EyesRequestHandler.feed = self.feed
         EyesRequestHandler.observations = self.observations
+        EyesRequestHandler.activity = self.activity
         server = ThreadingHTTPServer(("0.0.0.0", self.PORT), EyesRequestHandler)
         print(f"Claude's Eyes on http://localhost:{self.PORT}/ (camera {CameraFeed.DEVICE})")
         server.serve_forever()
