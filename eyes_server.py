@@ -36,9 +36,12 @@ class CameraFeed:
     def __init__(self, frame_path: Path):
         self.frame_path = frame_path
         self.process: subprocess.Popen | None = None
+        self.unpaused = threading.Event()
+        self.unpaused.set()
 
     def run_forever(self) -> None:
         while True:
+            self.unpaused.wait()
             self.process = subprocess.Popen(
                 [
                     "ffmpeg", "-hide_banner", "-loglevel", "error",
@@ -56,6 +59,17 @@ class CameraFeed:
         if not self.frame_path.exists():
             return None
         return time.time() - self.frame_path.stat().st_mtime
+
+    def pause(self) -> None:
+        self.unpaused.clear()
+        if self.process and self.process.poll() is None:
+            self.process.terminate()
+
+    def resume(self) -> None:
+        self.unpaused.set()
+
+    def is_paused(self) -> bool:
+        return not self.unpaused.is_set()
 
 
 class ObservationLog:
@@ -92,6 +106,9 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   img { max-width: 96vw; max-height: 70vh; border: 1px solid #2c343d; border-radius: 6px; }
   #status { font-size: 0.85em; color: #8b98a5; }
   .stale { color: #e0a458; }
+  #pause { background: #1e2833; color: #d8dee6; border: 1px solid #31404f; border-radius: 8px;
+           padding: 6px 18px; font-size: 0.9em; cursor: pointer; }
+  #pause.paused { background: #4a2b2b; border-color: #7a4040; }
   #bubble { max-width: 60ch; background: #1e2833; border: 1px solid #31404f; border-radius: 12px;
             padding: 10px 16px; font-size: 0.95em; line-height: 1.45; }
   #bubble .who { color: #6cb2ff; font-weight: 600; margin-right: 6px; }
@@ -104,6 +121,7 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
 <h1>&#128065; Claude's Eyes</h1>
 <img id="view" src="/frame.jpg" alt="camera frame">
 <div id="status">connecting&hellip;</div>
+<button id="pause">Pause Eyes</button>
 <div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
 <ul id="log"></ul>
 <script>
@@ -113,12 +131,26 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   const latest = document.getElementById('latest');
   const latestWhen = document.getElementById('latestWhen');
   const log = document.getElementById('log');
+  const pause = document.getElementById('pause');
+
+  let paused = false;
+  pause.addEventListener('click', async () => {
+    const data = await (await fetch(paused ? '/resume' : '/pause', {method: 'POST'})).json();
+    paused = data.paused;
+    pause.textContent = paused ? 'Resume Eyes' : 'Pause Eyes';
+    pause.className = paused ? 'paused' : '';
+  });
 
   const agoText = seconds => seconds < 90 ? Math.round(seconds) + 's ago'
       : seconds < 5400 ? Math.round(seconds / 60) + 'm ago'
       : Math.round(seconds / 3600) + 'h ago';
 
   setInterval(async () => {
+    if (paused) {
+      status.textContent = 'eyes paused \\u2014 nothing is being captured';
+      status.className = 'stale';
+      return;
+    }
     try {
       const response = await fetch('/frame.jpg?t=' + Date.now(), {cache: 'no-store'});
       if (!response.ok) throw new Error(response.status);
@@ -161,16 +193,22 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             self.send_page()
 
     def do_POST(self) -> None:
-        if not self.path.startswith("/observation"):
+        if self.path.startswith("/pause"):
+            self.feed.pause()
+            self.send_json(b'{"ok": true, "paused": true}')
+        elif self.path.startswith("/resume"):
+            self.feed.resume()
+            self.send_json(b'{"ok": true, "paused": false}')
+        elif self.path.startswith("/observation"):
+            length = int(self.headers.get("Content-Length", 0))
+            text = self.rfile.read(length).decode("utf-8", errors="replace").strip()
+            if not text:
+                self.send_error(400, "empty observation")
+                return
+            self.observations.add(text)
+            self.send_json(b'{"ok": true}')
+        else:
             self.send_error(404)
-            return
-        length = int(self.headers.get("Content-Length", 0))
-        text = self.rfile.read(length).decode("utf-8", errors="replace").strip()
-        if not text:
-            self.send_error(400, "empty observation")
-            return
-        self.observations.add(text)
-        self.send_json(b'{"ok": true}')
 
     def send_page(self) -> None:
         body = self.PAGE.encode()
@@ -189,6 +227,9 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_frame(self) -> None:
+        if self.feed.is_paused():
+            self.send_error(503, "eyes paused")
+            return
         age = self.feed.frame_age_seconds()
         if age is None:
             self.send_error(503, "no frame captured yet")
