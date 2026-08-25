@@ -104,11 +104,20 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
          display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
   h1 { font-size: 1.1em; font-weight: 600; margin: 0; }
   img { max-width: 96vw; max-height: 70vh; border: 1px solid #2c343d; border-radius: 6px; }
+  img[hidden] { display: none; }
+  #loader { width: min(96vw, 640px); height: 300px; border: 1px solid #2c343d; border-radius: 6px;
+            display: flex; align-items: center; justify-content: center; color: #8b98a5;
+            font-size: 0.9em; background: linear-gradient(100deg, #1a2027 40%, #232b34 50%, #1a2027 60%);
+            background-size: 300% 100%; animation: shimmer 1.6s infinite; }
+  #loader[hidden] { display: none; }
+  @keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+  @media (prefers-reduced-motion: reduce) { #loader { animation: none; } }
   #status { font-size: 0.85em; color: #8b98a5; }
   .stale { color: #e0a458; }
   #pause { background: #1e2833; color: #d8dee6; border: 1px solid #31404f; border-radius: 8px;
            padding: 6px 18px; font-size: 0.9em; cursor: pointer; }
   #pause.paused { background: #4a2b2b; border-color: #7a4040; }
+  #pause:disabled { opacity: 0.6; cursor: wait; }
   #bubble { max-width: 60ch; background: #1e2833; border: 1px solid #31404f; border-radius: 12px;
             padding: 10px 16px; font-size: 0.95em; line-height: 1.45; }
   #bubble .who { color: #6cb2ff; font-weight: 600; margin-right: 6px; }
@@ -119,7 +128,8 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
 </style></head>
 <body>
 <h1>&#128065; Claude's Eyes</h1>
-<img id="view" src="/frame.jpg" alt="camera frame">
+<div id="loader">warming up the eyes&hellip;</div>
+<img id="view" alt="camera frame" hidden>
 <div id="status">connecting&hellip;</div>
 <button id="pause">Pause Eyes</button>
 <div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
@@ -132,13 +142,25 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   const latestWhen = document.getElementById('latestWhen');
   const log = document.getElementById('log');
   const pause = document.getElementById('pause');
+  const loader = document.getElementById('loader');
 
   let paused = false;
   pause.addEventListener('click', async () => {
-    const data = await (await fetch(paused ? '/resume' : '/pause', {method: 'POST'})).json();
-    paused = data.paused;
-    pause.textContent = paused ? 'Resume Eyes' : 'Pause Eyes';
-    pause.className = paused ? 'paused' : '';
+    pause.disabled = true;
+    pause.textContent = paused ? 'Resuming\\u2026' : 'Pausing\\u2026';
+    try {
+      const data = await (await fetch(paused ? '/resume' : '/pause', {method: 'POST'})).json();
+      paused = data.paused;
+      if (!paused) {
+        view.hidden = true;
+        loader.hidden = false;
+        loader.textContent = 'reopening the eyes\\u2026';
+      }
+    } finally {
+      pause.disabled = false;
+      pause.textContent = paused ? 'Resume Eyes' : 'Pause Eyes';
+      pause.className = paused ? 'paused' : '';
+    }
   });
 
   const agoText = seconds => seconds < 90 ? Math.round(seconds) + 's ago'
@@ -156,6 +178,8 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
       if (!response.ok) throw new Error(response.status);
       const age = parseFloat(response.headers.get('X-Frame-Age') || '0');
       view.src = URL.createObjectURL(await response.blob());
+      view.hidden = false;
+      loader.hidden = true;
       status.textContent = age > 10
         ? 'camera offline? last frame ' + Math.round(age) + 's old'
         : 'live \\u00b7 frame ' + age.toFixed(1) + 's old';
