@@ -75,7 +75,7 @@ class CameraFeed:
 class ObservationLog:
     """What Claude said it saw, newest first, capped."""
 
-    MAX_ENTRIES = 50
+    MAX_ENTRIES = 200
     MAX_TEXT_BYTES = 2000
 
     def __init__(self) -> None:
@@ -125,6 +125,9 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   #log { max-width: 60ch; width: 100%; font-size: 0.8em; color: #8b98a5; list-style: none;
          padding: 0; margin: 0; }
   #log li { padding: 2px 0; border-top: 1px solid #1e242b; }
+  #grow { background: none; color: #6cb2ff; border: none; font-size: 0.8em; cursor: pointer;
+          padding: 4px 0; }
+  #grow[hidden] { display: none; }
 </style></head>
 <body>
 <h1>&#128065; Claude's Eyes</h1>
@@ -134,6 +137,7 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
 <button id="pause">Pause Eyes</button>
 <div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
 <ul id="log"></ul>
+<button id="grow" hidden>show older</button>
 <script>
   const view = document.getElementById('view');
   const status = document.getElementById('status');
@@ -190,6 +194,10 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
     }
   }, 500);
 
+  const grow = document.getElementById('grow');
+  let logLimit = 8;
+  grow.addEventListener('click', () => { logLimit += 20; });
+
   setInterval(async () => {
     try {
       const data = await (await fetch('/observations', {cache: 'no-store'})).json();
@@ -198,11 +206,14 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
       bubble.hidden = false;
       latest.textContent = entries[0].text;
       latestWhen.textContent = agoText(Date.now() / 1000 - entries[0].at);
-      log.replaceChildren(...entries.slice(1, 8).map(entry => {
+      log.replaceChildren(...entries.slice(1, logLimit).map(entry => {
         const item = document.createElement('li');
         item.textContent = agoText(Date.now() / 1000 - entry.at) + ' \\u2014 ' + entry.text;
         return item;
       }));
+      const hiddenCount = Math.max(0, entries.length - logLimit);
+      grow.hidden = hiddenCount === 0;
+      grow.textContent = 'show older (' + hiddenCount + ' more)';
     } catch (e) {}
   }, 1000);
 </script>
