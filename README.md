@@ -10,6 +10,15 @@ Claude        ──▶ http://localhost:8990/frame.jpg  grabs a frame per "look
 Claude        ──▶ POST /observation                "hmm, I see …" → speech bubble
 ```
 
+![The dashboard: live view with Claude's narration](images/claudes-eyes.png)
+
+Real sessions it has carried: Claude sizing an envelope against known desk
+objects, and closing a full design → print → verify loop on a label printer,
+narrating each step.
+
+| ![Measuring an envelope](images/envelope-measuring.png) | ![Design, print, verify](images/design-print-verify.png) |
+| --- | --- |
+
 ## Setup
 
 1. **Plug in a webcam.** Find its device node: it's the newest `/dev/videoN`
