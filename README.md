@@ -69,9 +69,12 @@ few seconds.
   Claude posts progress, and clears when the observation lands. Claude is
   told apart from browsers by user-agent, so the dashboard's own polling
   never triggers it.
-- **Speech bubble + history** — Claude's latest "hmm, I see …" with older
-  remarks below; "show older" grows the list (server keeps the last 200,
-  in memory only — a restart clears the log).
+- **Speech bubble** — Claude's latest "hmm, I see …" observation.
+- **Audit log** — a scrolling window of everything that happened, newest
+  first: every frame Claude fetched (bursts coalesce into one counted
+  line), every gimbal move and who made it, observations, activity lines,
+  pauses/resumes, server starts. Last 500 events, in memory only — a
+  restart clears it.
 - **Pause Eyes** — kills the capture process outright (a real privacy pause:
   nothing is recorded, and even Claude's `/frame.jpg` gets a 503 until you
   resume).
@@ -105,6 +108,7 @@ written together in one transaction.
 | `/status`            | GET    | `{paused, activity}`                            |
 | `/ptz`               | GET    | gimbal support, axis ranges, last commanded pose|
 | `/ptz`               | POST   | `{pan, tilt, zoom}` or `{recenter: true}`       |
+| `/events`            | GET    | audit log as JSON, newest first                 |
 | `/pause`, `/resume`  | POST   | stop/restart capture                            |
 
 ## Working with Claude

@@ -11,6 +11,7 @@ once:
     http://localhost:8990/status        paused flag + Claude's current activity
     http://localhost:8990/ptz           gimbal support, axis ranges, last pose
     POST /ptz          (JSON)           aim the camera (gimbal cameras only)
+    http://localhost:8990/events        audit log: looks, moves, observations
 
 Run:  make run   (uv supplies Python; ffmpeg must be installed)
 Stop: Ctrl+C
@@ -280,6 +281,38 @@ class ObservationLog:
             return json.dumps({"observations": self.entries}).encode()
 
 
+class EventLog:
+    """Unified audit trail of everything that happens to the Eyes: looks,
+    gimbal moves, observations, pauses. Newest first, in memory only, same
+    privacy posture as the observation log (a restart clears it). Repeated
+    frame fetches coalesce into one counted entry so a burst of looks
+    doesn't drown the log."""
+
+    MAX_ENTRIES = 500
+    MAX_TEXT_BYTES = 2000
+    COALESCE_SECONDS = 45
+
+    def __init__(self) -> None:
+        self.entries: list[dict] = []
+        self.lock = threading.Lock()
+
+    def add(self, kind: str, text: str, coalesce: bool = False) -> None:
+        now = time.time()
+        with self.lock:
+            if coalesce and self.entries:
+                newest = self.entries[0]
+                if newest["kind"] == kind and now - newest["at"] < self.COALESCE_SECONDS:
+                    newest["count"] += 1
+                    newest["at"] = now
+                    return
+            self.entries.insert(0, {"kind": kind, "text": text[: self.MAX_TEXT_BYTES], "at": now, "count": 1})
+            del self.entries[self.MAX_ENTRIES:]
+
+    def as_json(self) -> bytes:
+        with self.lock:
+            return json.dumps({"events": self.entries}).encode()
+
+
 class ClaudeActivity:
     """What Claude is doing with the Eyes right now, shown live on the dash.
     Set automatically when a non-browser client downloads a frame, refined by
@@ -311,9 +344,11 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
     observations: ObservationLog
     activity: ClaudeActivity
     ptz: GimbalPTZ
+    events: EventLog
 
     PAGE = """<!doctype html>
 <html><head><title>Claude's Eyes</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='46' fill='%2314181d'/><ellipse cx='50' cy='50' rx='38' ry='24' fill='white'/><circle cx='50' cy='50' r='15' fill='%236cb2ff'/><circle cx='50' cy='50' r='7' fill='%2314181d'/><circle cx='55' cy='45' r='3' fill='white'/></svg>">
 <style>
   body { margin: 0; background: #14181d; color: #d8dee6; font-family: system-ui, sans-serif;
          display: flex; flex-direction: column; align-items: center; gap: 12px; padding: 16px; }
@@ -337,12 +372,25 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             padding: 10px 16px; font-size: 0.95em; line-height: 1.45; }
   #bubble .who { color: #6cb2ff; font-weight: 600; margin-right: 6px; }
   #bubble .when { color: #8b98a5; font-size: 0.8em; margin-left: 8px; }
-  #log { max-width: 60ch; width: 100%; font-size: 0.8em; color: #8b98a5; list-style: none;
-         padding: 0; margin: 0; }
-  #log li { padding: 2px 0; border-top: 1px solid #1e242b; }
-  #grow { background: none; color: #6cb2ff; border: none; font-size: 0.8em; cursor: pointer;
-          padding: 4px 0; }
-  #grow[hidden] { display: none; }
+  #audit { max-width: 70ch; width: 100%; background: #10151a; border: 1px solid #2c343d;
+           border-radius: 8px; }
+  #auditHead { font-size: 0.8em; color: #8b98a5; padding: 6px 12px; border-bottom: 1px solid #1e242b;
+               display: flex; justify-content: space-between; }
+  #auditList { max-height: 38vh; overflow-y: auto; list-style: none; padding: 4px 12px 8px;
+               margin: 0; font-size: 0.8em; line-height: 1.5; }
+  #auditList li { padding: 3px 0; border-top: 1px solid #1a2027; display: flex; gap: 8px;
+                  align-items: baseline; }
+  #auditList li:first-child { border-top: none; }
+  #auditList .t { color: #5c6773; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+  #auditList .k { flex-shrink: 0; width: 9ch; font-weight: 600; }
+  #auditList .k.look { color: #6cb2ff; }
+  #auditList .k.move { color: #c792ea; }
+  #auditList .k.observation { color: #7dd3a0; }
+  #auditList .k.activity { color: #8b98a5; }
+  #auditList .k.pause, #auditList .k.resume { color: #e0a458; }
+  #auditList .k.start { color: #5c6773; }
+  #auditList .x { color: #b7c1cc; overflow-wrap: anywhere; }
+  #auditList .n { color: #5c6773; }
   #activity { font-size: 0.9em; color: #6cb2ff; display: flex; align-items: center; gap: 8px; }
   #activity[hidden] { display: none; }
   #activity .dot { width: 8px; height: 8px; border-radius: 50%; background: #6cb2ff;
@@ -364,15 +412,14 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
 <button id="pause">Pause Eyes</button>
 <div id="ptz" hidden><span id="ptzText"></span><button id="recenter">Recenter</button></div>
 <div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
-<ul id="log"></ul>
-<button id="grow" hidden>show older</button>
+<div id="audit"><div id="auditHead"><span>Audit log</span><span id="auditCount"></span></div>
+<ul id="auditList"></ul></div>
 <script>
   const view = document.getElementById('view');
   const status = document.getElementById('status');
   const bubble = document.getElementById('bubble');
   const latest = document.getElementById('latest');
   const latestWhen = document.getElementById('latestWhen');
-  const log = document.getElementById('log');
   const pause = document.getElementById('pause');
   const loader = document.getElementById('loader');
 
@@ -422,10 +469,6 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
     }
   }, 500);
 
-  const grow = document.getElementById('grow');
-  let logLimit = 8;
-  grow.addEventListener('click', () => { logLimit += 20; });
-
   const activity = document.getElementById('activity');
   const activityText = document.getElementById('activityText');
   setInterval(async () => {
@@ -474,14 +517,41 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
       bubble.hidden = false;
       latest.textContent = entries[0].text;
       latestWhen.textContent = agoText(Date.now() / 1000 - entries[0].at);
-      log.replaceChildren(...entries.slice(1, logLimit).map(entry => {
+    } catch (e) {}
+  }, 1000);
+
+  const auditList = document.getElementById('auditList');
+  const auditCount = document.getElementById('auditCount');
+  let auditSnapshot = '';
+  setInterval(async () => {
+    try {
+      const body = await (await fetch('/events', {cache: 'no-store'})).text();
+      if (body === auditSnapshot) return;
+      auditSnapshot = body;
+      const events = JSON.parse(body).events;
+      const scrolled = auditList.scrollTop;
+      auditList.replaceChildren(...events.map(event => {
         const item = document.createElement('li');
-        item.textContent = agoText(Date.now() / 1000 - entry.at) + ' \\u2014 ' + entry.text;
+        const when = document.createElement('span');
+        when.className = 't';
+        when.textContent = new Date(event.at * 1000).toLocaleTimeString([], {hour12: false});
+        const kind = document.createElement('span');
+        kind.className = 'k ' + event.kind;
+        kind.textContent = event.kind;
+        const text = document.createElement('span');
+        text.className = 'x';
+        text.textContent = event.text;
+        if (event.count > 1) {
+          const times = document.createElement('span');
+          times.className = 'n';
+          times.textContent = ' (\\u00d7' + event.count + ')';
+          text.appendChild(times);
+        }
+        item.append(when, kind, text);
         return item;
       }));
-      const hiddenCount = Math.max(0, entries.length - logLimit);
-      grow.hidden = hiddenCount === 0;
-      grow.textContent = 'show older (' + hiddenCount + ' more)';
+      auditList.scrollTop = scrolled;
+      auditCount.textContent = events.length + (events.length === 500 ? ' (cap)' : '');
     } catch (e) {}
   }, 1000);
 </script>
@@ -499,6 +569,8 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             }).encode())
         elif self.path.startswith("/ptz"):
             self.send_json(json.dumps(self.ptz.status()).encode())
+        elif self.path.startswith("/events"):
+            self.send_json(self.events.as_json())
         else:
             self.send_page()
 
@@ -508,9 +580,11 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path.startswith("/pause"):
             self.feed.pause()
+            self.events.add("pause", f"eyes paused by {self.actor()}")
             self.send_json(b'{"ok": true, "paused": true}')
         elif self.path.startswith("/resume"):
             self.feed.resume()
+            self.events.add("resume", f"eyes resumed by {self.actor()}")
             self.send_json(b'{"ok": true, "paused": false}')
         elif self.path.startswith("/observation"):
             length = int(self.headers.get("Content-Length", 0))
@@ -520,6 +594,7 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
                 return
             self.observations.add(text)
             self.activity.clear()
+            self.events.add("observation", text)
             self.send_json(b'{"ok": true}')
         elif self.path.startswith("/ptz"):
             self.handle_ptz()
@@ -530,9 +605,13 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
                 self.activity.clear()
             else:
                 self.activity.set(text)
+                self.events.add("activity", text)
             self.send_json(b'{"ok": true}')
         else:
             self.send_error(404)
+
+    def actor(self) -> str:
+        return "Claude" if self.is_claude() else "the dashboard"
 
     def handle_ptz(self) -> None:
         if not self.ptz.supported:
@@ -547,12 +626,17 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
                 self.activity.set("aiming the camera…")
             if request.get("recenter"):
                 result = self.ptz.recenter()
+                self.events.add("move", f"{self.actor()} recentered the camera")
             else:
                 result = self.ptz.move(
                     pan=request.get("pan"),
                     tilt=request.get("tilt"),
                     zoom=request.get("zoom"),
                 )
+                asked = ", ".join(
+                    f"{axis} {request[axis]}" for axis in ("pan", "tilt", "zoom") if request.get(axis) is not None
+                )
+                self.events.add("move", f"{self.actor()} aimed: {asked}")
         except (ValueError, TypeError) as error:
             self.send_error(400, str(error))
             return
@@ -587,6 +671,7 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             return
         if self.is_claude():
             self.activity.set("downloaded a frame, having a look…")
+            self.events.add("look", "Claude fetched a frame", coalesce=True)
         body = self.feed.frame_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
@@ -609,6 +694,7 @@ class EyesServer:
         self.observations = ObservationLog()
         self.activity = ClaudeActivity()
         self.ptz = GimbalPTZ(V4L2Device(self.feed.device))
+        self.events = EventLog()
 
     def run(self) -> None:
         threading.Thread(target=self.feed.run_forever, daemon=True).start()
@@ -616,6 +702,8 @@ class EyesServer:
         EyesRequestHandler.observations = self.observations
         EyesRequestHandler.activity = self.activity
         EyesRequestHandler.ptz = self.ptz
+        EyesRequestHandler.events = self.events
+        self.events.add("start", f"server started on camera {self.feed.device}")
         server = ThreadingHTTPServer(("0.0.0.0", self.port), EyesRequestHandler)
         gimbal = "gimbal PTZ available" if self.ptz.supported else "no gimbal"
         print(f"Claude's Eyes on http://localhost:{self.port}/ (camera {self.feed.device}, {gimbal})", flush=True)
