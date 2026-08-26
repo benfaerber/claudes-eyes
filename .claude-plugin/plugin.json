@@ -1,0 +1,9 @@
+{
+  "name": "claudes-eyes",
+  "description": "A shared desk webcam for pair-working with Claude Code: a live dashboard for you, frames on demand for Claude, with Claude's narration shown as speech bubbles.",
+  "version": "1.0.0",
+  "author": {
+    "name": "Ben Faerber",
+    "url": "https://github.com/benfaerber"
+  }
+}

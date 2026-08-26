@@ -1,0 +1,14 @@
+{
+  "name": "benfaerber",
+  "owner": {
+    "name": "Ben Faerber",
+    "url": "https://github.com/benfaerber"
+  },
+  "plugins": [
+    {
+      "name": "claudes-eyes",
+      "source": "./",
+      "description": "A shared desk webcam for pair-working with Claude Code: a live dashboard for you, frames on demand for Claude, with Claude's narration shown as speech bubbles."
+    }
+  ]
+}

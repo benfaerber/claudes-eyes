@@ -1,13 +1,13 @@
 # Claude's Eyes
 
 A shared desk webcam for pair-working with Claude Code. One small server owns
-the camera and serves frames over HTTP, so Ben's browser and Claude can both
+the camera and serves frames over HTTP, so your browser and Claude can both
 look at the same time — no fighting over the video device.
 
 ```
-Ben's browser ──▶ http://localhost:8990/           live dashboard
-Claude        ──▶ http://localhost:8990/frame.jpg  grabs a frame per "look"
-Claude        ──▶ POST /observation                "hmm, I see …" → speech bubble
+Your browser ──▶ http://localhost:8990/           live dashboard
+Claude       ──▶ http://localhost:8990/frame.jpg  grabs a frame per "look"
+Claude       ──▶ POST /observation                "hmm, I see …" → speech bubble
 ```
 
 ![The dashboard: live view with Claude's narration](images/claudes-eyes.png)
@@ -19,14 +19,27 @@ narrating each step.
 | ![Measuring an envelope](images/envelope-measuring.png) | ![Design, print, verify](images/design-print-verify.png) |
 | --- | --- |
 
-## Setup
+## Install as a Claude Code plugin (recommended)
 
-1. **Plug in a webcam.** Find its device node: it's the newest `/dev/videoN`
-   (check `ls -la /dev/video*` timestamps). If it isn't `/dev/video2`, change
-   `CameraFeed.DEVICE` in `eyes_server.py`.
-2. **Install [uv](https://docs.astral.sh/uv/) and ffmpeg** — the only two
-   system dependencies. The script itself is stdlib-only Python; uv supplies
-   the interpreter.
+The repo is a Claude Code plugin and its own marketplace. In Claude Code:
+
+```
+/plugin marketplace add benfaerber/claudes-eyes
+/plugin install claudes-eyes@benfaerber
+```
+
+That's it — install [uv](https://docs.astral.sh/uv/) and ffmpeg (the only two
+system dependencies), plug in a webcam, and say **"look"** (or just **`l`**)
+in any session. Claude starts the server itself if it isn't running, grabs a
+frame, and narrates to the dashboard at <http://localhost:8990/>. Working from
+a local clone instead? `/plugin marketplace add /path/to/claudes-eyes`.
+
+## Manual setup
+
+1. **Plug in a webcam.** The server auto-picks the newest `/dev/videoN`;
+   override with `EYES_DEVICE=/dev/video2` if it guesses wrong.
+2. **Install [uv](https://docs.astral.sh/uv/) and ffmpeg.** The script itself
+   is stdlib-only Python; uv supplies the interpreter.
 3. **Run it:**
 
    ```sh
@@ -36,9 +49,9 @@ narrating each step.
 4. Open <http://localhost:8990/> — you should see the live view within a few
    seconds. It binds all interfaces, so a phone on the same LAN works too.
 
-Mounted the camera upside-down? The server rotates frames 180° in ffmpeg
-(`transpose=1,transpose=1` in `CameraFeed`) — remove that filter for a
-right-side-up mount.
+Configuration is by environment variable: `EYES_DEVICE` (camera node),
+`EYES_ROTATE` (`0`/`90`/`180`/`270` clockwise — use `180` for an upside-down
+mount), and `EYES_PORT` (default `8990`).
 
 Only one process may own a camera: close any preview app before starting the
 server, and never open `/dev/videoN` directly while it runs. If the camera is
@@ -75,8 +88,9 @@ few seconds.
 
 ## Working with Claude
 
-Tell Claude the server is running (or let it start the server itself) and
-that `l` means "look now". On each look Claude fetches a frame, zooms by
-cropping the JPEG locally when detail matters, replies in chat, and posts the
-short version to the dashboard. This protocol lives in Claude's CLAUDE.md /
-the repo's AGENTS.md so new sessions pick it up automatically.
+The whole protocol ships as the plugin's `look` skill
+([skills/look/SKILL.md](skills/look/SKILL.md)): `l` means "look now"; on each
+look Claude fetches a frame, zooms by cropping the JPEG locally when detail
+matters, replies in chat, and posts the short version to the dashboard. With
+the plugin installed, every new session picks it up automatically — no
+CLAUDE.md notes needed.

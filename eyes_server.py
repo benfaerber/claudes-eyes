@@ -1,7 +1,7 @@
 """Claude's Eyes — shared webcam dashboard.
 
-One process owns /dev/video2 (the desk webcam, mounted upside-down on the
-monitor) and serves the live view to everyone at once:
+One process owns the desk webcam and serves the live view to everyone at
+once:
 
     http://localhost:8990/              the dashboard Ben watches
     http://localhost:8990/frame.jpg     the latest frame Claude curls
@@ -20,6 +20,7 @@ Stop: Ctrl+C
 # ///
 
 import json
+import os
 import subprocess
 import threading
 import time
@@ -29,31 +30,50 @@ from pathlib import Path
 
 class CameraFeed:
     """Owns the camera via a self-restarting ffmpeg that continuously
-    overwrites frames/latest.jpg (rotated 180 for the upside-down mount)."""
+    overwrites the latest-frame JPEG.
 
-    DEVICE = "/dev/video2"
+    Configure via environment:
+        EYES_DEVICE  camera node (default: newest /dev/video*)
+        EYES_ROTATE  0, 90, 180 or 270 degrees clockwise (default 0)
+    """
+
     FPS = 4
     RESTART_DELAY_SECONDS = 3
+    ROTATION_FILTERS = {"0": None, "90": "transpose=1", "180": "transpose=1,transpose=1", "270": "transpose=2"}
 
     def __init__(self, frame_path: Path):
         self.frame_path = frame_path
+        self.device = os.environ.get("EYES_DEVICE") or self.newest_video_device()
+        self.rotation_filter = self.ROTATION_FILTERS.get(os.environ.get("EYES_ROTATE", "0"))
         self.process: subprocess.Popen | None = None
         self.unpaused = threading.Event()
         self.unpaused.set()
 
+    @staticmethod
+    def newest_video_device() -> str:
+        devices = sorted(Path("/dev").glob("video*"), key=lambda d: d.stat().st_mtime)
+        if not devices:
+            raise SystemExit("No /dev/video* device found — plug in a webcam or set EYES_DEVICE.")
+        return str(devices[-1])
+
+    def ffmpeg_command(self) -> list[str]:
+        command = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "v4l2", "-video_size", "1920x1080",
+            "-i", self.device,
+        ]
+        if self.rotation_filter:
+            command += ["-vf", self.rotation_filter]
+        command += [
+            "-r", str(self.FPS), "-q:v", "5",
+            "-update", "1", "-y", str(self.frame_path),
+        ]
+        return command
+
     def run_forever(self) -> None:
         while True:
             self.unpaused.wait()
-            self.process = subprocess.Popen(
-                [
-                    "ffmpeg", "-hide_banner", "-loglevel", "error",
-                    "-f", "v4l2", "-video_size", "1920x1080",
-                    "-i", self.DEVICE,
-                    "-vf", "transpose=1,transpose=1",
-                    "-r", str(self.FPS), "-q:v", "5",
-                    "-update", "1", "-y", str(self.frame_path),
-                ],
-            )
+            self.process = subprocess.Popen(self.ffmpeg_command())
             self.process.wait()
             time.sleep(self.RESTART_DELAY_SECONDS)
 
@@ -353,11 +373,10 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
 
 
 class EyesServer:
-    PORT = 8990
-
     def __init__(self) -> None:
-        frame_path = Path(__file__).parent / "frames" / "latest.jpg"
-        frame_path.parent.mkdir(exist_ok=True)
+        self.port = int(os.environ.get("EYES_PORT", "8990"))
+        frame_path = Path.home() / ".cache" / "claudes-eyes" / "latest.jpg"
+        frame_path.parent.mkdir(parents=True, exist_ok=True)
         self.feed = CameraFeed(frame_path)
         self.observations = ObservationLog()
         self.activity = ClaudeActivity()
@@ -367,8 +386,8 @@ class EyesServer:
         EyesRequestHandler.feed = self.feed
         EyesRequestHandler.observations = self.observations
         EyesRequestHandler.activity = self.activity
-        server = ThreadingHTTPServer(("0.0.0.0", self.PORT), EyesRequestHandler)
-        print(f"Claude's Eyes on http://localhost:{self.PORT}/ (camera {CameraFeed.DEVICE})")
+        server = ThreadingHTTPServer(("0.0.0.0", self.port), EyesRequestHandler)
+        print(f"Claude's Eyes on http://localhost:{self.port}/ (camera {self.feed.device})")
         server.serve_forever()
 
 
