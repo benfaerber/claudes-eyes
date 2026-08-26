@@ -9,6 +9,8 @@ once:
     http://localhost:8990/observations  the narration log as JSON
     POST /activity     (plain text)     Claude reports what it's doing mid-look
     http://localhost:8990/status        paused flag + Claude's current activity
+    http://localhost:8990/ptz           gimbal support, axis ranges, last pose
+    POST /ptz          (JSON)           aim the camera (gimbal cameras only)
 
 Run:  make run   (uv supplies Python; ffmpeg must be installed)
 Stop: Ctrl+C
@@ -19,13 +21,173 @@ Stop: Ctrl+C
 # dependencies = []
 # ///
 
+import ctypes
+import fcntl
 import json
 import os
+import struct
 import subprocess
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+
+class V4L2Device:
+    """Minimal stdlib ioctl access to a /dev/video* node. V4L2 allows a
+    second fd for capability queries and controls while ffmpeg owns the
+    stream, so this opens per call and never touches the video data."""
+
+    QUERYCAP = 0x80685600
+    QUERYCTRL = 0xC0445624
+    S_CTRL = 0xC008561C
+    S_EXT_CTRLS = 0xC0205648
+    EXT_CONTROL_BYTES = 20
+    CAP_VIDEO_CAPTURE = 0x00000001
+    CAP_DEVICE_CAPS = 0x80000000
+    CTRL_FLAG_DISABLED = 0x00000001
+
+    def __init__(self, path: str):
+        self.path = path
+
+    def _ioctl(self, request: int, buffer: bytearray) -> bytearray:
+        fd = os.open(self.path, os.O_RDWR | os.O_NONBLOCK)
+        try:
+            fcntl.ioctl(fd, request, buffer)
+        finally:
+            os.close(fd)
+        return buffer
+
+    def is_capture_device(self) -> bool:
+        """False for the metadata sibling nodes modern UVC cameras expose
+        (the Insta360 Link 2's /dev/video1 has no video formats at all)."""
+        try:
+            buffer = self._ioctl(self.QUERYCAP, bytearray(104))
+        except OSError:
+            return False
+        capabilities, device_caps = struct.unpack_from("II", buffer, 84)
+        effective = device_caps if capabilities & self.CAP_DEVICE_CAPS else capabilities
+        return bool(effective & self.CAP_VIDEO_CAPTURE)
+
+    def query_control(self, control_id: int) -> dict | None:
+        buffer = bytearray(68)
+        struct.pack_into("I", buffer, 0, control_id)
+        try:
+            self._ioctl(self.QUERYCTRL, buffer)
+        except OSError:
+            return None
+        _, _, _, minimum, maximum, step, default, flags = struct.unpack_from("II32siiiiI", buffer)
+        if flags & self.CTRL_FLAG_DISABLED:
+            return None
+        return {"min": minimum, "max": maximum, "step": step, "default": default}
+
+    def set_control(self, control_id: int, value: int) -> None:
+        self._ioctl(self.S_CTRL, bytearray(struct.pack("Ii", control_id, value)))
+
+    def set_controls(self, values: dict[int, int]) -> None:
+        """Sets several controls in one VIDIOC_S_EXT_CTRLS transaction.
+        Needed for pan+tilt: they share one UVC control, the driver
+        read-modify-writes single-axis changes, and cameras with broken
+        readback (Insta360 Link 2) then fail validation with ERANGE."""
+        array = ctypes.create_string_buffer(self.EXT_CONTROL_BYTES * len(values))
+        for index, (control_id, value) in enumerate(values.items()):
+            struct.pack_into("IIIi", array, self.EXT_CONTROL_BYTES * index, control_id, 0, 0, value)
+        header = struct.pack("IIIiI4xQ", 0, len(values), 0, 0, 0, ctypes.addressof(array))
+        self._ioctl(self.S_EXT_CTRLS, bytearray(header))
+
+
+class GimbalPTZ:
+    """Aims gimbal cameras (e.g. the Insta360 Link 2) through the standard
+    UVC pan/tilt/zoom controls. Pan and tilt are absolute in arc-seconds;
+    the Link 2 returns garbage when those controls are read back, so the
+    last commanded pose is tracked here and the hardware is never asked."""
+
+    PAN = 0x009A0908
+    TILT = 0x009A0909
+    ZOOM = 0x009A090D
+    ARCSECONDS_PER_DEGREE = 3600
+
+    def __init__(self, device: V4L2Device):
+        self.device = device
+        self.ranges = {
+            "pan": device.query_control(self.PAN),
+            "tilt": device.query_control(self.TILT),
+            "zoom": device.query_control(self.ZOOM),
+        }
+        self.commanded: dict[str, float | int] = {}
+        self.lock = threading.Lock()
+
+    @property
+    def supported(self) -> bool:
+        return any(self.ranges.values())
+
+    def status(self) -> dict:
+        axes = {}
+        for name, control_range in self.ranges.items():
+            if not control_range:
+                continue
+            if name in ("pan", "tilt"):
+                axes[name] = {
+                    "unit": "degrees",
+                    "min": control_range["min"] / self.ARCSECONDS_PER_DEGREE,
+                    "max": control_range["max"] / self.ARCSECONDS_PER_DEGREE,
+                }
+            else:
+                axes[name] = {"unit": "native", **control_range}
+        with self.lock:
+            return {"supported": self.supported, "axes": axes, "commanded": dict(self.commanded) or None}
+
+    def move(self, pan: float | None = None, tilt: float | None = None, zoom: int | None = None) -> dict:
+        with self.lock:
+            if pan is not None or tilt is not None:
+                self._aim(pan, tilt)
+            if zoom is not None:
+                if not self.ranges["zoom"]:
+                    raise ValueError("this camera has no zoom control")
+                snapped = self._snap("zoom", zoom)
+                self.device.set_control(self.ZOOM, snapped)
+                self.commanded["zoom"] = snapped
+        return self.status()
+
+    def _aim(self, pan: float | None, tilt: float | None) -> None:
+        """Pan and tilt are one shared UVC control whose readback the
+        Link 2 corrupts, so both axes are always written together, the
+        unrequested one filled from the last commanded pose (0° when the
+        pose was never commanded and is therefore unknowable)."""
+        if not (self.ranges["pan"] and self.ranges["tilt"]):
+            self._aim_single_axis(pan, tilt)
+            return
+        pan = self.commanded.get("pan", 0.0) if pan is None else pan
+        tilt = self.commanded.get("tilt", 0.0) if tilt is None else tilt
+        pan_units = self._snap("pan", pan * self.ARCSECONDS_PER_DEGREE)
+        tilt_units = self._snap("tilt", tilt * self.ARCSECONDS_PER_DEGREE)
+        self.device.set_controls({self.PAN: pan_units, self.TILT: tilt_units})
+        self.commanded["pan"] = pan_units / self.ARCSECONDS_PER_DEGREE
+        self.commanded["tilt"] = tilt_units / self.ARCSECONDS_PER_DEGREE
+
+    def _aim_single_axis(self, pan: float | None, tilt: float | None) -> None:
+        for name, control_id, degrees in (("pan", self.PAN, pan), ("tilt", self.TILT, tilt)):
+            if degrees is None:
+                continue
+            if not self.ranges[name]:
+                raise ValueError(f"this camera has no {name} control")
+            units = self._snap(name, degrees * self.ARCSECONDS_PER_DEGREE)
+            self.device.set_control(control_id, units)
+            self.commanded[name] = units / self.ARCSECONDS_PER_DEGREE
+
+    def recenter(self) -> dict:
+        zoom_default = self.ranges["zoom"]["default"] if self.ranges["zoom"] else None
+        return self.move(
+            pan=0 if self.ranges["pan"] else None,
+            tilt=0 if self.ranges["tilt"] else None,
+            zoom=zoom_default,
+        )
+
+    def _snap(self, name: str, value: float) -> int:
+        control_range = self.ranges[name]
+        step = control_range["step"] or 1
+        clamped = max(control_range["min"], min(control_range["max"], value))
+        return int(control_range["min"] + round((clamped - control_range["min"]) / step) * step)
 
 
 class CameraFeed:
@@ -52,9 +214,12 @@ class CameraFeed:
     @staticmethod
     def newest_video_device() -> str:
         devices = sorted(Path("/dev").glob("video*"), key=lambda d: d.stat().st_mtime)
-        if not devices:
-            raise SystemExit("No /dev/video* device found — plug in a webcam or set EYES_DEVICE.")
-        return str(devices[-1])
+        capture_devices = [d for d in devices if V4L2Device(str(d)).is_capture_device()]
+        if not capture_devices:
+            raise SystemExit(
+                "No capture-capable /dev/video* device found — plug in a webcam or set EYES_DEVICE."
+            )
+        return str(capture_devices[-1])
 
     def ffmpeg_command(self) -> list[str]:
         command = [
@@ -145,6 +310,7 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
     feed: CameraFeed
     observations: ObservationLog
     activity: ClaudeActivity
+    ptz: GimbalPTZ
 
     PAGE = """<!doctype html>
 <html><head><title>Claude's Eyes</title>
@@ -181,6 +347,11 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
   #activity[hidden] { display: none; }
   #activity .dot { width: 8px; height: 8px; border-radius: 50%; background: #6cb2ff;
                    animation: blink 1.2s infinite; }
+  #ptz { font-size: 0.85em; color: #8b98a5; display: flex; align-items: center; gap: 10px; }
+  #ptz[hidden] { display: none; }
+  #recenter { background: #1e2833; color: #d8dee6; border: 1px solid #31404f; border-radius: 8px;
+              padding: 3px 12px; font-size: 0.9em; cursor: pointer; }
+  #recenter:disabled { opacity: 0.6; cursor: wait; }
   @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
   @media (prefers-reduced-motion: reduce) { #activity .dot { animation: none; } }
 </style></head>
@@ -191,6 +362,7 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
 <div id="status">connecting&hellip;</div>
 <div id="activity" hidden><span class="dot"></span><span id="activityText"></span></div>
 <button id="pause">Pause Eyes</button>
+<div id="ptz" hidden><span id="ptzText"></span><button id="recenter">Recenter</button></div>
 <div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
 <ul id="log"></ul>
 <button id="grow" hidden>show older</button>
@@ -269,6 +441,31 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
     } catch (e) {}
   }, 500);
 
+  const ptz = document.getElementById('ptz');
+  const ptzText = document.getElementById('ptzText');
+  const recenter = document.getElementById('recenter');
+  let ptzSupported = null;
+  const showPtz = data => {
+    ptzSupported = data.supported;
+    if (!data.supported) return;
+    ptz.hidden = false;
+    const pose = data.commanded || {};
+    const axis = (name, unit) => name in pose ? pose[name] + unit : '?';
+    ptzText.textContent = 'gimbal: pan ' + axis('pan', '\\u00b0') + ' \\u00b7 tilt '
+        + axis('tilt', '\\u00b0') + ' \\u00b7 zoom ' + axis('zoom', '');
+  };
+  setInterval(async () => {
+    if (ptzSupported === false) return;
+    try { showPtz(await (await fetch('/ptz', {cache: 'no-store'})).json()); } catch (e) {}
+  }, 2000);
+  recenter.addEventListener('click', async () => {
+    recenter.disabled = true;
+    try {
+      const response = await fetch('/ptz', {method: 'POST', body: JSON.stringify({recenter: true})});
+      showPtz(await response.json());
+    } finally { recenter.disabled = false; }
+  });
+
   setInterval(async () => {
     try {
       const data = await (await fetch('/observations', {cache: 'no-store'})).json();
@@ -300,6 +497,8 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
                 "paused": self.feed.is_paused(),
                 "activity": self.activity.snapshot(),
             }).encode())
+        elif self.path.startswith("/ptz"):
+            self.send_json(json.dumps(self.ptz.status()).encode())
         else:
             self.send_page()
 
@@ -322,6 +521,8 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             self.observations.add(text)
             self.activity.clear()
             self.send_json(b'{"ok": true}')
+        elif self.path.startswith("/ptz"):
+            self.handle_ptz()
         elif self.path.startswith("/activity"):
             length = int(self.headers.get("Content-Length", 0))
             text = self.rfile.read(length).decode("utf-8", errors="replace").strip()
@@ -332,6 +533,33 @@ class EyesRequestHandler(BaseHTTPRequestHandler):
             self.send_json(b'{"ok": true}')
         else:
             self.send_error(404)
+
+    def handle_ptz(self) -> None:
+        if not self.ptz.supported:
+            self.send_error(501, "this camera has no pan/tilt/zoom controls")
+            return
+        length = int(self.headers.get("Content-Length", 0))
+        try:
+            request = json.loads(self.rfile.read(length) or b"{}")
+            if not isinstance(request, dict):
+                raise ValueError("body must be a JSON object")
+            if self.is_claude():
+                self.activity.set("aiming the camera…")
+            if request.get("recenter"):
+                result = self.ptz.recenter()
+            else:
+                result = self.ptz.move(
+                    pan=request.get("pan"),
+                    tilt=request.get("tilt"),
+                    zoom=request.get("zoom"),
+                )
+        except (ValueError, TypeError) as error:
+            self.send_error(400, str(error))
+            return
+        except OSError as error:
+            self.send_error(503, f"camera rejected the move: {error}")
+            return
+        self.send_json(json.dumps(result).encode())
 
     def send_page(self) -> None:
         body = self.PAGE.encode()
@@ -380,14 +608,17 @@ class EyesServer:
         self.feed = CameraFeed(frame_path)
         self.observations = ObservationLog()
         self.activity = ClaudeActivity()
+        self.ptz = GimbalPTZ(V4L2Device(self.feed.device))
 
     def run(self) -> None:
         threading.Thread(target=self.feed.run_forever, daemon=True).start()
         EyesRequestHandler.feed = self.feed
         EyesRequestHandler.observations = self.observations
         EyesRequestHandler.activity = self.activity
+        EyesRequestHandler.ptz = self.ptz
         server = ThreadingHTTPServer(("0.0.0.0", self.port), EyesRequestHandler)
-        print(f"Claude's Eyes on http://localhost:{self.port}/ (camera {self.feed.device})")
+        gimbal = "gimbal PTZ available" if self.ptz.supported else "no gimbal"
+        print(f"Claude's Eyes on http://localhost:{self.port}/ (camera {self.feed.device}, {gimbal})", flush=True)
         server.serve_forever()
 
 

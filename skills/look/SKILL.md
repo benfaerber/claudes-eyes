@@ -55,6 +55,8 @@ Configuration is by environment variable, set when launching the server:
    ffmpeg -y -i <scratchpad>/frame.jpg -vf "crop=W:H:X:Y" <scratchpad>/crop.jpg
    ```
 
+   On gimbal cameras, real optical zoom via `/ptz` (below) beats cropping.
+
 3. **Narrate longer tasks** by posting progress lines mid-look; they replace
    the dashboard's activity line:
 
@@ -69,6 +71,45 @@ Configuration is by environment variable, set when launching the server:
    ```sh
    curl -s http://localhost:8990/observation --data 'hmm, I see a padded envelope, roughly A5 sized'
    ```
+
+## Aiming the camera (gimbal cameras)
+
+On a gimbal camera (Insta360 Link 2 and similar) you can physically aim your
+own eyes. Check support and the current pose first:
+
+```sh
+curl -s http://localhost:8990/ptz
+```
+
+`supported: false` (or a 501 from POST) means a fixed camera — crop instead.
+Otherwise `axes` gives each axis's range and `commanded` the last commanded
+pose (`null` right after a server start: the pose is unknown because such
+cameras report garbage when read, so the server only trusts what it has
+itself commanded).
+
+Aim with any subset of `pan` (degrees, positive pans the view right), `tilt`
+(degrees, positive tilts up), and `zoom` (the camera's native units — see
+`axes.zoom` for the range; on the Link 2, 100–400 means 1x–4x):
+
+```sh
+curl -s -X POST http://localhost:8990/ptz --data '{"pan": 15, "tilt": 5}'
+curl -s -X POST http://localhost:8990/ptz --data '{"zoom": 300}'
+curl -s -X POST http://localhost:8990/ptz --data '{"recenter": true}'
+```
+
+Rules of the loop:
+
+- **Wait ~2 seconds after a move** before fetching a frame; the gimbal is
+  physical and the next frame may still show motion blur.
+- **Iterate visually**: move, fetch, look, correct. Pan and tilt are absolute,
+  so small corrections are cheap.
+- **When only one of pan/tilt is given, the other is re-commanded** from the
+  tracked pose (0 if unknown). Right after a server start, expect the first
+  aim command to also square up the axis you didn't mention.
+- **Leave the camera roughly where you found it**: recenter (which also
+  resets zoom) or restore the pose you started from when you finish a task
+  that moved it, and say so in your observation. The user can also hit
+  Recenter on the dashboard.
 
 ## Failure modes
 

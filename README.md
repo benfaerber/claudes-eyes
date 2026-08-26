@@ -36,8 +36,10 @@ a local clone instead? `/plugin marketplace add /path/to/claudes-eyes`.
 
 ## Manual setup
 
-1. **Plug in a webcam.** The server auto-picks the newest `/dev/videoN`;
-   override with `EYES_DEVICE=/dev/video2` if it guesses wrong.
+1. **Plug in a webcam.** The server auto-picks the newest capture-capable
+   `/dev/videoN` (skipping the format-less metadata nodes modern UVC cameras
+   expose as siblings); override with `EYES_DEVICE=/dev/video2` if it guesses
+   wrong.
 2. **Install [uv](https://docs.astral.sh/uv/) and ffmpeg.** The script itself
    is stdlib-only Python; uv supplies the interpreter.
 3. **Run it:**
@@ -73,6 +75,23 @@ few seconds.
 - **Pause Eyes** — kills the capture process outright (a real privacy pause:
   nothing is recorded, and even Claude's `/frame.jpg` gets a 503 until you
   resume).
+- **Gimbal readout + Recenter** — on gimbal cameras, the last commanded
+  pan/tilt/zoom pose, with a button that recenters the camera and resets
+  zoom (`?` means nobody has aimed it since the server started).
+
+## Gimbal cameras (pan/tilt/zoom)
+
+On cameras with a motorized gimbal (built with the Insta360 Link 2), Claude
+can aim its own eyes: `POST /ptz` drives pan/tilt in degrees and zoom in the
+camera's native units, all over standard UVC controls — no vendor software.
+`GET /ptz` reports support, axis ranges, and the last commanded pose. Fixed
+webcams simply report `supported: false` and Claude falls back to cropping.
+
+Two Link 2 quirks the server absorbs: pan/tilt reads return garbage, so the
+server tracks the pose it commanded instead of asking the hardware; and
+single-axis writes fail with ERANGE (pan and tilt share one UVC control and
+the driver read-modify-writes the garbage back), so both axes are always
+written together in one transaction.
 
 ## API
 
@@ -84,6 +103,8 @@ few seconds.
 | `/observation`       | POST   | plain-text note → speech bubble, clears activity|
 | `/activity`          | POST   | plain-text progress line (empty body clears)    |
 | `/status`            | GET    | `{paused, activity}`                            |
+| `/ptz`               | GET    | gimbal support, axis ranges, last commanded pose|
+| `/ptz`               | POST   | `{pan, tilt, zoom}` or `{recenter: true}`       |
 | `/pause`, `/resume`  | POST   | stop/restart capture                            |
 
 ## Working with Claude
