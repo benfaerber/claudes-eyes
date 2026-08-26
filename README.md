@@ -40,8 +40,9 @@ a local clone instead? `/plugin marketplace add /path/to/claudes-eyes`.
    `/dev/videoN` (skipping the format-less metadata nodes modern UVC cameras
    expose as siblings); override with `EYES_DEVICE=/dev/video2` if it guesses
    wrong.
-2. **Install [uv](https://docs.astral.sh/uv/) and ffmpeg.** The script itself
-   is stdlib-only Python; uv supplies the interpreter.
+2. **Install [uv](https://docs.astral.sh/uv/) and ffmpeg.** The app is a
+   small Flask package (`eyes/`: camera layer, logs, routes, templates,
+   static assets); uv supplies the interpreter and Flask on first run.
 3. **Run it:**
 
    ```sh

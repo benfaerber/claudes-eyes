@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+<head>
+<title>Claude's Eyes</title>
+<meta charset="utf-8">
+<link rel="icon" href="{{ url_for('static', filename='favicon.svg') }}">
+<link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+<h1>&#128065; Claude's Eyes</h1>
+<div id="loader">warming up the eyes&hellip;</div>
+<img id="view" alt="camera frame" hidden>
+<div id="status">connecting&hellip;</div>
+<div id="activity" hidden><span class="dot"></span><span id="activityText"></span></div>
+<button id="pause">Pause Eyes</button>
+<div id="ptz" hidden><span id="ptzText"></span><button id="recenter">Recenter</button></div>
+<div id="bubble" hidden><span class="who">Claude</span><span id="latest"></span><span class="when" id="latestWhen"></span></div>
+<div id="audit"><div id="auditHead"><span>Audit log</span><span id="auditCount"></span></div>
+<ul id="auditList"></ul></div>
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
