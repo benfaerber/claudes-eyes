@@ -7,6 +7,7 @@ import struct
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -92,6 +93,7 @@ class GimbalPTZ:
             "zoom": device.query_control(self.ZOOM),
         }
         self.commanded: dict[str, float | int] = {}
+        self.paused = False
         self.lock = threading.Lock()
 
     @property
@@ -112,7 +114,26 @@ class GimbalPTZ:
             else:
                 axes[name] = {"unit": "native", **control_range}
         with self.lock:
-            return {"supported": self.supported, "axes": axes, "commanded": dict(self.commanded) or None}
+            return {
+                "supported": self.supported,
+                "paused": self.paused,
+                "axes": axes,
+                "commanded": dict(self.commanded) or None,
+            }
+
+    def pause(self) -> None:
+        """Freezes the gimbal where it is: every move is refused until
+        resume(). The pose stays tracked, so nothing is lost by pausing."""
+        with self.lock:
+            self.paused = True
+
+    def resume(self) -> None:
+        with self.lock:
+            self.paused = False
+
+    def is_paused(self) -> bool:
+        with self.lock:
+            return self.paused
 
     def move(self, pan: float | None = None, tilt: float | None = None, zoom: int | None = None) -> dict:
         with self.lock:
@@ -167,9 +188,21 @@ class GimbalPTZ:
         return int(control_range["min"] + round((clamped - control_range["min"]) / step) * step)
 
 
+class FrameUnavailable(Exception):
+    """There is no frame that can honestly be served as current."""
+
+
+@dataclass(frozen=True)
+class Frame:
+    data: bytes
+    age_seconds: float
+
+
 class CameraFeed:
     """Owns the camera via a self-restarting ffmpeg that continuously
-    overwrites the latest-frame JPEG.
+    overwrites the latest-frame JPEG. A frame is only served while it is
+    younger than MAX_FRAME_AGE_SECONDS; after that it has expired and is
+    refused rather than passed off as live.
 
     Configure via environment:
         EYES_DEVICE  camera node (default: newest capture-capable /dev/video*)
@@ -178,6 +211,7 @@ class CameraFeed:
 
     FPS = 4
     RESTART_DELAY_SECONDS = 3
+    MAX_FRAME_AGE_SECONDS = 10
     ROTATION_FILTERS = {"0": None, "90": "transpose=1", "180": "transpose=1,transpose=1", "270": "transpose=2"}
 
     def __init__(self, frame_path: Path):
@@ -223,6 +257,26 @@ class CameraFeed:
         if not self.frame_path.exists():
             return None
         return time.time() - self.frame_path.stat().st_mtime
+
+    def frame_status(self) -> dict | None:
+        age = self.frame_age_seconds()
+        if age is None:
+            return None
+        return {"age": round(age, 1), "expired": age > self.MAX_FRAME_AGE_SECONDS}
+
+    def latest_frame(self) -> Frame:
+        """The newest frame, refused when it can't be trusted as current:
+        capture paused, nothing written yet, or a frame past its expiry
+        (camera unplugged, held by another app, or left over on disk from
+        a previous run)."""
+        if self.is_paused():
+            raise FrameUnavailable("eyes paused")
+        age = self.frame_age_seconds()
+        if age is None:
+            raise FrameUnavailable("no frame captured yet")
+        if age > self.MAX_FRAME_AGE_SECONDS:
+            raise FrameUnavailable(f"frame expired: last frame is {age:.0f}s old, camera offline?")
+        return Frame(self.frame_path.read_bytes(), age)
 
     def pause(self) -> None:
         self.unpaused.clear()
