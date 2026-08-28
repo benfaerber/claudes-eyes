@@ -1,10 +1,14 @@
 """The HTTP layer: same API the stdlib server spoke, now as a blueprint.
 
 Claude is told apart from browsers by user agent, so the dashboard's own
-polling never shows up as Claude activity or audit-log looks.
+polling never shows up as Claude activity or audit-log looks. Errors are
+JSON (`{"error": ...}`) so a curl from Claude reads the reason directly.
 """
 
 from flask import Blueprint, Response, abort, current_app, jsonify, render_template, request
+from werkzeug.exceptions import HTTPException
+
+from .camera import FrameUnavailable
 
 bp = Blueprint("eyes", __name__)
 
@@ -21,6 +25,11 @@ def actor() -> str:
     return "Claude" if is_claude() else "the dashboard"
 
 
+@bp.errorhandler(HTTPException)
+def json_error(error: HTTPException):
+    return jsonify(error=error.description), error.code
+
+
 @bp.get("/")
 def dashboard():
     return render_template("dashboard.html")
@@ -29,18 +38,17 @@ def dashboard():
 @bp.get("/frame.jpg")
 def frame():
     eyes = state()
-    if eyes.feed.is_paused():
-        abort(503, description="eyes paused")
-    age = eyes.feed.frame_age_seconds()
-    if age is None:
-        abort(503, description="no frame captured yet")
+    try:
+        latest = eyes.feed.latest_frame()
+    except FrameUnavailable as error:
+        abort(503, description=str(error))
     if is_claude():
         eyes.activity.set("downloaded a frame, having a look…")
         eyes.events.add("look", "Claude fetched a frame", coalesce=True)
     return Response(
-        eyes.feed.frame_path.read_bytes(),
+        latest.data,
         mimetype="image/jpeg",
-        headers={"Cache-Control": "no-store", "X-Frame-Age": f"{age:.1f}"},
+        headers={"Cache-Control": "no-store", "X-Frame-Age": f"{latest.age_seconds:.1f}"},
     )
 
 
@@ -52,7 +60,12 @@ def observations():
 @bp.get("/status")
 def status():
     eyes = state()
-    return jsonify({"paused": eyes.feed.is_paused(), "activity": eyes.activity.snapshot()})
+    return jsonify({
+        "paused": eyes.feed.is_paused(),
+        "movement_paused": eyes.ptz.is_paused(),
+        "frame": eyes.feed.frame_status(),
+        "activity": eyes.activity.snapshot(),
+    })
 
 
 @bp.get("/ptz")
@@ -94,6 +107,8 @@ def ptz_move():
     eyes = state()
     if not eyes.ptz.supported:
         abort(501, description="this camera has no pan/tilt/zoom controls")
+    if eyes.ptz.is_paused():
+        abort(503, description="movement paused")
     body = request.get_json(force=True, silent=True)
     if not isinstance(body, dict):
         abort(400, description="body must be a JSON object")
@@ -114,6 +129,22 @@ def ptz_move():
     except OSError as error:
         abort(503, description=f"camera rejected the move: {error}")
     return jsonify(result)
+
+
+@bp.post("/ptz/pause")
+def ptz_pause():
+    eyes = state()
+    eyes.ptz.pause()
+    eyes.events.add("pause", f"movement paused by {actor()}")
+    return jsonify(ok=True, paused=True)
+
+
+@bp.post("/ptz/resume")
+def ptz_resume():
+    eyes = state()
+    eyes.ptz.resume()
+    eyes.events.add("resume", f"movement resumed by {actor()}")
+    return jsonify(ok=True, paused=False)
 
 
 @bp.post("/pause")

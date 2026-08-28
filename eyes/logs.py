@@ -7,10 +7,13 @@ import time
 
 
 class ObservationLog:
-    """What Claude said it saw, newest first, capped."""
+    """What Claude said it saw, newest first, capped. Observations expire
+    after MAX_AGE_SECONDS so the dashboard's speech bubble never presents
+    an old "hmm, I see …" as current; the audit log keeps the history."""
 
     MAX_ENTRIES = 200
     MAX_TEXT_BYTES = 2000
+    MAX_AGE_SECONDS = 600
 
     def __init__(self) -> None:
         self.entries: list[dict] = []
@@ -20,11 +23,17 @@ class ObservationLog:
         entry = {"text": text[: self.MAX_TEXT_BYTES], "at": time.time()}
         with self.lock:
             self.entries.insert(0, entry)
+            self._expire()
             del self.entries[self.MAX_ENTRIES:]
 
     def as_dict(self) -> dict:
         with self.lock:
-            return {"observations": list(self.entries)}
+            self._expire()
+            return {"observations": list(self.entries), "expire_after": self.MAX_AGE_SECONDS}
+
+    def _expire(self) -> None:
+        cutoff = time.time() - self.MAX_AGE_SECONDS
+        self.entries = [entry for entry in self.entries if entry["at"] >= cutoff]
 
 
 class ClaudeActivity:

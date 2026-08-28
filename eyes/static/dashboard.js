@@ -1,54 +1,101 @@
 const view = document.getElementById('view');
 const status = document.getElementById('status');
+const loader = document.getElementById('loader');
 const bubble = document.getElementById('bubble');
 const latest = document.getElementById('latest');
 const latestWhen = document.getElementById('latestWhen');
-const pause = document.getElementById('pause');
-const loader = document.getElementById('loader');
-
-let paused = false;
-pause.addEventListener('click', async () => {
-  pause.disabled = true;
-  pause.textContent = paused ? 'Resuming…' : 'Pausing…';
-  try {
-    const data = await (await fetch(paused ? '/resume' : '/pause', {method: 'POST'})).json();
-    paused = data.paused;
-    if (!paused) {
-      view.hidden = true;
-      loader.hidden = false;
-      loader.textContent = 'reopening the eyes…';
-    }
-  } finally {
-    pause.disabled = false;
-    pause.textContent = paused ? 'Resume Eyes' : 'Pause Eyes';
-    pause.className = paused ? 'paused' : '';
-  }
-});
 
 const agoText = seconds => seconds < 90 ? Math.round(seconds) + 's ago'
     : seconds < 5400 ? Math.round(seconds / 60) + 'm ago'
     : Math.round(seconds / 3600) + 'h ago';
 
+const setStatus = (text, stale) => {
+  status.textContent = text;
+  status.className = stale ? 'stale' : '';
+};
+
+class PauseToggle {
+  constructor(id, name, urls, onChange = () => {}) {
+    this.button = document.getElementById(id);
+    this.name = name;
+    this.urls = urls;
+    this.onChange = onChange;
+    this.paused = false;
+    this.button.addEventListener('click', () => this.toggle());
+  }
+
+  get busy() { return this.button.disabled; }
+
+  sync(paused) {
+    if (this.busy || paused === this.paused) return;
+    this.paused = paused;
+    this.render();
+  }
+
+  render() {
+    this.button.textContent = (this.paused ? 'Resume ' : 'Pause ') + this.name;
+    this.button.classList.toggle('paused', this.paused);
+  }
+
+  async toggle() {
+    this.button.disabled = true;
+    this.button.textContent = this.paused ? 'Resuming…' : 'Pausing…';
+    try {
+      const response = await fetch(this.paused ? this.urls.resume : this.urls.pause, {method: 'POST'});
+      if (response.ok) {
+        this.paused = (await response.json()).paused;
+        this.onChange(this.paused);
+      }
+    } finally {
+      this.button.disabled = false;
+      this.render();
+    }
+  }
+}
+
+const eyes = new PauseToggle('pause', 'Eyes', {pause: '/pause', resume: '/resume'}, paused => {
+  if (paused) return;
+  view.hidden = true;
+  loader.hidden = false;
+  loader.textContent = 'reopening the eyes…';
+});
+const movement = new PauseToggle('movement', 'Movement', {pause: '/ptz/pause', resume: '/ptz/resume'});
+
+let lastStatus = null;
+
+const showLiveFrame = async response => {
+  const age = parseFloat(response.headers.get('X-Frame-Age') || '0');
+  const previous = view.src;
+  view.src = URL.createObjectURL(await response.blob());
+  if (previous) URL.revokeObjectURL(previous);
+  view.hidden = false;
+  view.classList.remove('expired');
+  loader.hidden = true;
+  setStatus('live · frame ' + age.toFixed(1) + 's old', false);
+};
+
+const showUnavailable = async response => {
+  const info = await response.json().catch(() => ({error: 'HTTP ' + response.status}));
+  const frame = lastStatus && lastStatus.frame;
+  if (frame && frame.expired && !view.hidden) {
+    view.classList.add('expired');
+    setStatus('frame expired — camera offline? last frame ' + agoText(frame.age), true);
+  } else {
+    setStatus(info.error, true);
+  }
+};
+
 setInterval(async () => {
-  if (paused) {
-    status.textContent = 'eyes paused — nothing is being captured';
-    status.className = 'stale';
+  if (eyes.paused) {
+    view.classList.add('expired');
+    setStatus('eyes paused — nothing is being captured', true);
     return;
   }
   try {
     const response = await fetch('/frame.jpg?t=' + Date.now(), {cache: 'no-store'});
-    if (!response.ok) throw new Error(response.status);
-    const age = parseFloat(response.headers.get('X-Frame-Age') || '0');
-    view.src = URL.createObjectURL(await response.blob());
-    view.hidden = false;
-    loader.hidden = true;
-    status.textContent = age > 10
-      ? 'camera offline? last frame ' + Math.round(age) + 's old'
-      : 'live · frame ' + age.toFixed(1) + 's old';
-    status.className = age > 10 ? 'stale' : '';
+    await (response.ok ? showLiveFrame(response) : showUnavailable(response));
   } catch (e) {
-    status.textContent = 'no frames yet (' + e.message + ')';
-    status.className = 'stale';
+    setStatus('no frames yet (' + e.message + ')', true);
   }
 }, 500);
 
@@ -56,11 +103,13 @@ const activity = document.getElementById('activity');
 const activityText = document.getElementById('activityText');
 setInterval(async () => {
   try {
-    const data = await (await fetch('/status', {cache: 'no-store'})).json();
-    const seconds = data.activity ? Date.now() / 1000 - data.activity.at : 999;
-    if (data.activity && seconds < 120) {
+    lastStatus = await (await fetch('/status', {cache: 'no-store'})).json();
+    eyes.sync(lastStatus.paused);
+    movement.sync(lastStatus.movement_paused);
+    const seconds = lastStatus.activity ? Date.now() / 1000 - lastStatus.activity.at : 999;
+    if (lastStatus.activity && seconds < 120) {
       activity.hidden = false;
-      activityText.textContent = 'Claude: ' + data.activity.text + ' (' + agoText(seconds) + ')';
+      activityText.textContent = 'Claude: ' + lastStatus.activity.text + ' (' + agoText(seconds) + ')';
     } else {
       activity.hidden = true;
     }
@@ -71,10 +120,13 @@ const ptz = document.getElementById('ptz');
 const ptzText = document.getElementById('ptzText');
 const recenter = document.getElementById('recenter');
 let ptzSupported = null;
+let recentering = false;
 const showPtz = data => {
   ptzSupported = data.supported;
   if (!data.supported) return;
   ptz.hidden = false;
+  movement.sync(data.paused);
+  recenter.disabled = recentering || data.paused;
   const pose = data.commanded || {};
   const axis = (name, unit) => name in pose ? pose[name] + unit : '?';
   ptzText.textContent = 'gimbal: pan ' + axis('pan', '°') + ' · tilt '
@@ -85,18 +137,25 @@ setInterval(async () => {
   try { showPtz(await (await fetch('/ptz', {cache: 'no-store'})).json()); } catch (e) {}
 }, 2000);
 recenter.addEventListener('click', async () => {
+  recentering = true;
   recenter.disabled = true;
   try {
     const response = await fetch('/ptz', {method: 'POST', body: JSON.stringify({recenter: true})});
-    showPtz(await response.json());
-  } finally { recenter.disabled = false; }
+    if (response.ok) showPtz(await response.json());
+  } finally {
+    recentering = false;
+    recenter.disabled = movement.paused;
+  }
 });
 
 setInterval(async () => {
   try {
     const data = await (await fetch('/observations', {cache: 'no-store'})).json();
     const entries = data.observations;
-    if (!entries.length) return;
+    if (!entries.length) {
+      bubble.hidden = true;
+      return;
+    }
     bubble.hidden = false;
     latest.textContent = entries[0].text;
     latestWhen.textContent = agoText(Date.now() / 1000 - entries[0].at);

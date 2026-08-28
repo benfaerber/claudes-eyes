@@ -63,14 +63,19 @@ few seconds.
 
 ## The dashboard
 
-- **Live view** at ~4 fps with a staleness indicator (turns amber if frames
-  stop) and shimmer placeholders while the camera warms up or reopens.
+- **Live view** at ~4 fps with a staleness indicator and shimmer
+  placeholders while the camera warms up or reopens. A frame older than 10 s
+  is **expired**: the server refuses to serve it (Claude's `/frame.jpg` gets
+  a 503 instead of a stale picture) and the dashboard dims the last frame and
+  says how old it is, so an old frame is never mistaken for a live one.
 - **Claude activity** — a pulsing blue line ("Claude: downloaded a frame,
   having a look…") appears the moment Claude fetches a frame, updates as
   Claude posts progress, and clears when the observation lands. Claude is
   told apart from browsers by user-agent, so the dashboard's own polling
   never triggers it.
-- **Speech bubble** — Claude's latest "hmm, I see …" observation.
+- **Speech bubble** — Claude's latest "hmm, I see …" observation. It
+  expires after 10 minutes: the bubble disappears rather than presenting an
+  old remark as current (the audit log keeps the history).
 - **Audit log** — a scrolling window of everything that happened, newest
   first: every frame Claude fetched (bursts coalesce into one counted
   line), every gimbal move and who made it, observations, activity lines,
@@ -82,6 +87,10 @@ few seconds.
 - **Gimbal readout + Recenter** — on gimbal cameras, the last commanded
   pan/tilt/zoom pose, with a button that recenters the camera and resets
   zoom (`?` means nobody has aimed it since the server started).
+- **Pause Movement** — freezes the gimbal where it is: every `POST /ptz`
+  (Claude's aims and the dashboard's Recenter alike) gets a 503 until you
+  resume. Independent of Pause Eyes, so you can keep looking while the
+  camera stays put.
 
 ## Gimbal cameras (pan/tilt/zoom)
 
@@ -102,15 +111,19 @@ written together in one transaction.
 | Route                | Method | What                                            |
 | -------------------- | ------ | ----------------------------------------------- |
 | `/`                  | GET    | the dashboard                                   |
-| `/frame.jpg`         | GET    | latest frame; `X-Frame-Age` header in seconds   |
-| `/observations`      | GET    | narration log as JSON, newest first             |
+| `/frame.jpg`         | GET    | latest frame; `X-Frame-Age` header in seconds; 503 when paused, not yet captured, or expired (>10 s old) |
+| `/observations`      | GET    | narration log as JSON, newest first; entries expire after `expire_after` seconds |
 | `/observation`       | POST   | plain-text note → speech bubble, clears activity|
 | `/activity`          | POST   | plain-text progress line (empty body clears)    |
-| `/status`            | GET    | `{paused, activity}`                            |
-| `/ptz`               | GET    | gimbal support, axis ranges, last commanded pose|
-| `/ptz`               | POST   | `{pan, tilt, zoom}` or `{recenter: true}`       |
+| `/status`            | GET    | `{paused, movement_paused, frame: {age, expired}, activity}` |
+| `/ptz`               | GET    | gimbal support, paused flag, axis ranges, last commanded pose |
+| `/ptz`               | POST   | `{pan, tilt, zoom}` or `{recenter: true}`; 503 while movement is paused |
+| `/ptz/pause`, `/ptz/resume` | POST | freeze/unfreeze the gimbal                 |
 | `/events`            | GET    | audit log as JSON, newest first                 |
 | `/pause`, `/resume`  | POST   | stop/restart capture                            |
+
+Errors come back as JSON (`{"error": "movement paused"}`) with the matching
+HTTP status.
 
 ## Working with Claude
 

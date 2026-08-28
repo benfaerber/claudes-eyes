@@ -4,13 +4,14 @@ One process owns the desk webcam and serves the live view to everyone at
 once:
 
     http://localhost:8990/              the dashboard Ben watches
-    http://localhost:8990/frame.jpg     the latest frame Claude curls
+    http://localhost:8990/frame.jpg     the latest frame Claude curls (503 once expired)
     POST /observation  (plain text)     Claude narrates what it just saw
     http://localhost:8990/observations  the narration log as JSON
     POST /activity     (plain text)     Claude reports what it's doing mid-look
-    http://localhost:8990/status        paused flag + Claude's current activity
+    http://localhost:8990/status        paused flags, frame age + Claude's activity
     http://localhost:8990/ptz           gimbal support, axis ranges, last pose
     POST /ptz          (JSON)           aim the camera (gimbal cameras only)
+    POST /ptz/pause, /ptz/resume        freeze / unfreeze the gimbal
     http://localhost:8990/events        audit log: looks, moves, observations
 
 The app itself lives in the eyes/ package (Flask, camera, logs, templates);
